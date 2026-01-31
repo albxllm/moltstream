@@ -2,6 +2,7 @@
 -- Real-time bidirectional communication with OpenClaw
 
 local M = {}
+local git = require("moltstream.git")
 
 -- State
 local job_id = nil
@@ -19,6 +20,7 @@ local defaults = {
   binary = "moltstream",
   keymap = {
     send = "<leader>ms",
+    send_code = "<leader>mc",  -- Send code with git context
     open = "<leader>mo",
     history = "<leader>mu",
   },
@@ -33,6 +35,7 @@ function M.setup(opts)
   -- Create commands
   vim.api.nvim_create_user_command("MoltOpen", M.open, {})
   vim.api.nvim_create_user_command("MoltSend", M.send_visual, {})
+  vim.api.nvim_create_user_command("MoltSendCode", M.send_code, {})
   vim.api.nvim_create_user_command("MoltHistory", M.fetch_history, {})
   vim.api.nvim_create_user_command("MoltStatus", M.status, {})
   vim.api.nvim_create_user_command("MoltClose", M.close, {})
@@ -44,6 +47,9 @@ function M.setup(opts)
   if config.keymap.send then
     vim.keymap.set("v", config.keymap.send, M.send_visual, { desc = "Moltstream: Send selection" })
     vim.keymap.set("n", config.keymap.send, M.send_line, { desc = "Moltstream: Send line/paragraph" })
+  end
+  if config.keymap.send_code then
+    vim.keymap.set("v", config.keymap.send_code, M.send_code, { desc = "Moltstream: Send code with git context" })
   end
   if config.keymap.history then
     vim.keymap.set("n", config.keymap.history, M.fetch_history, { desc = "Moltstream: Fetch history" })
@@ -370,6 +376,46 @@ function M.send_line()
   end
   
   M.send_message(line)
+end
+
+-- Send code with git context (for PR workflows)
+function M.send_code()
+  -- Get visual selection
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  local start_line, end_line = start_pos[2], end_pos[2]
+  local lines = vim.fn.getline(start_line, end_line)
+  
+  if #lines == 0 then
+    vim.notify("[moltstream] No code selected", vim.log.levels.WARN)
+    return
+  end
+  
+  -- Handle partial line selection
+  local start_col, end_col = start_pos[3], end_pos[3]
+  if #lines == 1 then
+    lines[1] = string.sub(lines[1], start_col, end_col)
+  else
+    lines[1] = string.sub(lines[1], start_col)
+    lines[#lines] = string.sub(lines[#lines], 1, end_col)
+  end
+  
+  local code = table.concat(lines, "\n")
+  local filepath = vim.fn.expand("%:p")
+  
+  -- Get git metadata
+  local meta = git.get_metadata(filepath, start_line, end_line)
+  local context = git.format_context(meta, code)
+  
+  -- Add task instruction based on git status
+  local instruction
+  if meta.is_git and meta.remote_url then
+    instruction = "\n\n**Task:** Please review this code and suggest improvements. If changes are needed, you can create a PR to `" .. (meta.repo or "the repo") .. "`."
+  else
+    instruction = "\n\n**Task:** Please review this code and suggest improvements. Note: This is not in a git repo I can access, so please provide the changes as a diff or updated code block."
+  end
+  
+  M.send_message(context .. instruction)
 end
 
 -- Send any message string
