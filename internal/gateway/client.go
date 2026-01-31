@@ -52,8 +52,8 @@ type GatewayFrame struct {
 }
 
 type FrameError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    interface{} `json:"code"` // Can be int or string
+	Message string      `json:"message"`
 }
 
 type ConnectChallenge struct {
@@ -184,6 +184,7 @@ func (c *Client) handleFrame(frame *GatewayFrame) {
 			c.mu.Unlock()
 			log.Printf("Connected to gateway!")
 		} else if frame.Error != nil {
+			log.Printf("Gateway error: code=%v message=%s", frame.Error.Code, frame.Error.Message)
 			if c.onError != nil {
 				c.onError(fmt.Errorf("gateway error: %s", frame.Error.Message))
 			}
@@ -309,8 +310,6 @@ func (c *Client) Send(content string) error {
 			"sessionKey":     "moltstream",
 			"message":        content,
 			"idempotencyKey": fmt.Sprintf("molt-%d", time.Now().UnixNano()),
-			"stream":         true,  // Enable streaming response
-			"deliver":        false, // Don't deliver to external channels (WhatsApp etc)
 		},
 	}
 
