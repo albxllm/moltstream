@@ -9,6 +9,7 @@ local session_buf = nil
 local config = {}
 local response_in_progress = false
 local pending_response = ""
+local response_start_line = nil  -- Track where response content begins
 
 -- Default configuration
 local defaults = {
@@ -144,47 +145,49 @@ function handle_stream(params)
     return
   end
 
-  -- Start new response block if needed
-  if not response_in_progress then
-    response_in_progress = true
-    pending_response = ""
-    
-    -- Insert response header
-    local lines = vim.api.nvim_buf_get_lines(session_buf, 0, -1, false)
-    local timestamp = os.date("%H:%M")
-    local header = {
-      "",
-      "---",
-      "",
-      "## Assistant [" .. timestamp .. "]",
-      "",
-    }
-    vim.api.nvim_buf_set_lines(session_buf, -1, -1, false, header)
-  end
-
-  -- Append delta
-  if params.delta and params.delta ~= "" then
-    pending_response = pending_response .. params.delta
-    
-    -- Update buffer with current response
-    local lines = vim.split(pending_response, "\n", { plain = true })
-    local line_count = vim.api.nvim_buf_line_count(session_buf)
-    
-    -- Find the line after "## Assistant" header to replace
-    local start_line = find_last_assistant_content_line()
-    if start_line then
-      vim.api.nvim_buf_set_lines(session_buf, start_line, -1, false, lines)
+  -- Schedule on main thread to avoid race conditions
+  vim.schedule(function()
+    -- Start new response block if needed
+    if not response_in_progress then
+      response_in_progress = true
+      pending_response = ""
+      
+      -- Insert response header
+      local timestamp = os.date("%H:%M")
+      local header = {
+        "",
+        "---",
+        "",
+        "## Assistant [" .. timestamp .. "]",
+        "",
+      }
+      vim.api.nvim_buf_set_lines(session_buf, -1, -1, false, header)
+      -- Store the line where content will start (0-indexed)
+      response_start_line = vim.api.nvim_buf_line_count(session_buf)
     end
-    
-    -- Auto-scroll
-    if config.auto_scroll then
-      local win = find_buffer_window(session_buf)
-      if win then
-        local new_line_count = vim.api.nvim_buf_line_count(session_buf)
-        vim.api.nvim_win_set_cursor(win, { new_line_count, 0 })
+
+    -- Append delta
+    if params.delta and params.delta ~= "" then
+      pending_response = pending_response .. params.delta
+      
+      -- Update buffer with current response
+      local lines = vim.split(pending_response, "\n", { plain = true })
+      
+      -- Replace from stored start line to end
+      if response_start_line then
+        vim.api.nvim_buf_set_lines(session_buf, response_start_line, -1, false, lines)
+      end
+      
+      -- Auto-scroll
+      if config.auto_scroll then
+        local win = find_buffer_window(session_buf)
+        if win then
+          local new_line_count = vim.api.nvim_buf_line_count(session_buf)
+          vim.api.nvim_win_set_cursor(win, { new_line_count, 0 })
+        end
       end
     end
-  end
+  end)
 end
 
 -- Find the content line after last Assistant header
@@ -208,6 +211,7 @@ end
 function finalize_response()
   response_in_progress = false
   pending_response = ""
+  response_start_line = nil
   
   if session_buf and vim.api.nvim_buf_is_valid(session_buf) then
     -- Add trailing newline and separator

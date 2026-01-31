@@ -309,6 +309,8 @@ func (c *Client) Send(content string) error {
 			"sessionKey":     "moltstream",
 			"message":        content,
 			"idempotencyKey": fmt.Sprintf("molt-%d", time.Now().UnixNano()),
+			"stream":         true,  // Enable streaming response
+			"deliver":        false, // Don't deliver to external channels (WhatsApp etc)
 		},
 	}
 
