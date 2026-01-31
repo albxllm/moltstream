@@ -8,7 +8,7 @@ gateway:
   
   # Authentication token
   # Can use environment variable reference or hardcode
-  token: "${OPENCLAW_TOKEN}"
+  token: "${OPENCLAW_GATEWAY_TOKEN}"
 
 session:
   # Where to store session files
