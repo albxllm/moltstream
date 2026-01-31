@@ -164,7 +164,7 @@ func (c *Client) readLoop() {
 
 		var frame GatewayFrame
 		if err := json.Unmarshal(message, &frame); err != nil {
-			log.Printf("parse frame: %v", err)
+			log.Printf("parse frame: %v (raw: %s)", err, string(message))
 			continue
 		}
 
