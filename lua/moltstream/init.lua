@@ -37,6 +37,7 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("MoltOpen", M.open, {})
   vim.api.nvim_create_user_command("MoltClose", M.close, {})
   vim.api.nvim_create_user_command("MoltToggle", M.toggle, {})
+  vim.api.nvim_create_user_command("MoltClear", M.clear, {})
   vim.api.nvim_create_user_command("MoltSend", M.send_visual, {})
   vim.api.nvim_create_user_command("MoltSendCode", M.send_code, {})
   vim.api.nvim_create_user_command("MoltHistory", M.fetch_history, {})
@@ -359,6 +360,33 @@ function M.toggle()
   else
     M.open()
   end
+end
+
+-- Clear/reset everything (use when state gets broken)
+function M.clear()
+  -- Reset all state
+  response_in_progress = false
+  pending_response = ""
+  response_start_line = nil
+  stdout_buffer = ""
+  
+  -- Reset agent buffer
+  if agent_buf and vim.api.nvim_buf_is_valid(agent_buf) then
+    vim.api.nvim_buf_set_lines(agent_buf, 0, -1, false, {
+      "# Agent Responses",
+      "",
+    })
+  end
+  
+  -- Reset user buffer
+  if user_buf and vim.api.nvim_buf_is_valid(user_buf) then
+    vim.api.nvim_buf_set_lines(user_buf, 0, -1, false, {
+      "# Message History",
+      "",
+    })
+  end
+  
+  vim.notify("[moltstream] State cleared", vim.log.levels.INFO)
 end
 
 -- Send selected text in visual mode
