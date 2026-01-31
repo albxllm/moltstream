@@ -46,9 +46,16 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	// Token is optional when using CLI mode
-	if config.Gateway.Token == "${OPENCLAW_TOKEN}" {
+	// Token from env (new name takes priority)
+	if envToken := os.Getenv("MOLTSTREAM_OPENCLAW_GATEWAY_TOKEN"); envToken != "" {
+		config.Gateway.Token = envToken
+	} else if config.Gateway.Token == "${OPENCLAW_TOKEN}" {
 		config.Gateway.Token = os.Getenv("OPENCLAW_TOKEN")
+	}
+	
+	// Tailscale IP override
+	if tsIP := os.Getenv("MOLTSTREAM_TAILSCALE_GATEWAY_IP"); tsIP != "" {
+		config.Gateway.URL = "ws://" + tsIP + ":18789"
 	}
 
 	bridge, err := NewBridge(config)
