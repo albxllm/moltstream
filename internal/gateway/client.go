@@ -1,44 +1,26 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
-	"log"
-	"net/http"
+	"os/exec"
+	"strings"
 	"sync"
-	"time"
-
-	"github.com/gorilla/websocket"
 )
 
+// Client wraps openclaw CLI for gateway communication
 type Client struct {
-	url       string
-	token     string
-	conn      *websocket.Conn
+	sessionID string
 	mu        sync.Mutex
-	connected bool
 	onMessage func(content string, done bool)
 	onError   func(err error)
-	ctx       context.Context
-	cancel    context.CancelFunc
-}
-
-type GatewayMessage struct {
-	Type    string `json:"type"`
-	Content string `json:"content,omitempty"`
-	Delta   string `json:"delta,omitempty"`
-	Done    bool   `json:"done,omitempty"`
-	Error   string `json:"error,omitempty"`
 }
 
 func NewClient(url, token string) *Client {
-	ctx, cancel := context.WithCancel(context.Background())
+	// URL and token not used - we use CLI instead
 	return &Client{
-		url:    url,
-		token:  token,
-		ctx:    ctx,
-		cancel: cancel,
+		sessionID: "moltstream",
 	}
 }
 
@@ -51,111 +33,89 @@ func (c *Client) OnError(fn func(err error)) {
 }
 
 func (c *Client) Connect() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	header := http.Header{}
-	header.Set("Authorization", "Bearer "+c.token)
-
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
-
-	conn, _, err := dialer.Dial(c.url, header)
-	if err != nil {
-		return fmt.Errorf("websocket dial: %w", err)
-	}
-
-	c.conn = conn
-	c.connected = true
-
-	go c.readLoop()
-
+	// No persistent connection needed with CLI approach
 	return nil
 }
 
-func (c *Client) readLoop() {
-	defer func() {
-		c.mu.Lock()
-		c.connected = false
-		c.mu.Unlock()
-	}()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-
-		_, message, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				if c.onError != nil {
-					c.onError(fmt.Errorf("websocket read: %w", err))
-				}
-			}
-			return
-		}
-
-		var msg GatewayMessage
-		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("parse gateway message: %v", err)
-			continue
-		}
-
-		switch msg.Type {
-		case "stream", "delta":
-			if c.onMessage != nil {
-				c.onMessage(msg.Delta, msg.Done)
-			}
-		case "response", "message":
-			if c.onMessage != nil {
-				c.onMessage(msg.Content, true)
-			}
-		case "error":
-			if c.onError != nil {
-				c.onError(fmt.Errorf("gateway error: %s", msg.Error))
-			}
-		}
-	}
+func (c *Client) IsConnected() bool {
+	return true // Always "connected" since we use CLI
 }
 
 func (c *Client) Send(content string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if !c.connected || c.conn == nil {
-		return fmt.Errorf("not connected")
+	ctx, cancel := context.WithTimeout(context.Background(), 600*1000*1000*1000) // 600s
+	defer cancel()
+
+	// Use openclaw agent command
+	cmd := exec.CommandContext(ctx, "openclaw", "agent",
+		"--session-id", c.sessionID,
+		"--message", content,
+	)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
 	}
 
-	msg := map[string]interface{}{
-		"type":    "message",
-		"content": content,
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("stderr pipe: %w", err)
 	}
 
-	return c.conn.WriteJSON(msg)
-}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start command: %w", err)
+	}
 
-func (c *Client) IsConnected() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connected
+	// Read stdout line by line and stream to callback
+	go func() {
+		scanner := bufio.NewScanner(stdout)
+		var fullResponse strings.Builder
+		
+		for scanner.Scan() {
+			line := scanner.Text()
+			fullResponse.WriteString(line)
+			fullResponse.WriteString("\n")
+			
+			if c.onMessage != nil {
+				c.onMessage(line+"\n", false)
+			}
+		}
+		
+		// Signal completion
+		if c.onMessage != nil {
+			c.onMessage("", true)
+		}
+	}()
+
+	// Read stderr for errors
+	go func() {
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if c.onError != nil && line != "" {
+				c.onError(fmt.Errorf("%s", line))
+			}
+		}
+	}()
+
+	// Wait for completion in background
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			if c.onError != nil {
+				c.onError(fmt.Errorf("command failed: %w", err))
+			}
+		}
+	}()
+
+	return nil
 }
 
 func (c *Client) Close() error {
-	c.cancel()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn != nil {
-		return c.conn.Close()
-	}
 	return nil
 }
 
 func (c *Client) Reconnect() error {
-	c.Close()
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	return c.Connect()
+	return nil
 }
