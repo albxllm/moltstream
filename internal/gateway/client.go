@@ -179,23 +179,8 @@ func (c *Client) handleFrame(frame *GatewayFrame) {
 	case "event":
 		c.handleEvent(frame)
 	case "res":
-		log.Printf("response: id=%s ok=%v result=%s", frame.ID, frame.Ok, string(frame.Result))
+		log.Printf("response: id=%s ok=%v", frame.ID, frame.Ok)
 		if frame.Ok {
-			// Check if this is a chat.send response with runId
-			if frame.ID != "" && len(frame.ID) >= 5 && frame.ID[:5] == "chat-" {
-				var result struct {
-					RunID string `json:"runId"`
-				}
-				if err := json.Unmarshal(frame.Result, &result); err == nil && result.RunID != "" {
-					c.mu.Lock()
-					c.activeRunID = result.RunID
-					c.lastContent = ""
-					c.mu.Unlock()
-					log.Printf("Tracking runId: %s", result.RunID)
-				} else {
-					log.Printf("failed to extract runId: %v", err)
-				}
-			}
 			// Mark connected on successful connect
 			c.mu.Lock()
 			c.connected = true
@@ -353,6 +338,12 @@ func (c *Client) Send(content string) error {
 
 	c.reqID++
 	reqID := fmt.Sprintf("chat-%d", c.reqID)
+	idempotencyKey := fmt.Sprintf("molt-%d", time.Now().UnixNano())
+	
+	// Gateway uses idempotencyKey as runId, so track it now
+	c.activeRunID = idempotencyKey
+	c.lastContent = ""
+	
 	frame := map[string]interface{}{
 		"type":   "req",
 		"id":     reqID,
@@ -360,11 +351,11 @@ func (c *Client) Send(content string) error {
 		"params": map[string]interface{}{
 			"sessionKey":     "main",
 			"message":        content,
-			"idempotencyKey": fmt.Sprintf("molt-%d", time.Now().UnixNano()),
+			"idempotencyKey": idempotencyKey,
 		},
 	}
 
-	log.Printf("sending chat.send with id=%s", reqID)
+	log.Printf("sending chat.send id=%s, tracking runId=%s", reqID, idempotencyKey)
 	return c.conn.WriteJSON(frame)
 }
 
