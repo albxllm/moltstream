@@ -46,13 +46,9 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	// Expand env vars in token
+	// Token is optional when using CLI mode
 	if config.Gateway.Token == "${OPENCLAW_TOKEN}" {
 		config.Gateway.Token = os.Getenv("OPENCLAW_TOKEN")
-	}
-
-	if config.Gateway.Token == "" {
-		log.Fatal("OPENCLAW_TOKEN not set")
 	}
 
 	bridge, err := NewBridge(config)
