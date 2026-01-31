@@ -3,8 +3,8 @@
 
 gateway:
   # OpenClaw gateway WebSocket URL
-  # Replace with your Tailscale IP if different
-  url: "ws://100.104.217.17:3000/api/sessions/main/ws"
+  # Default is local gateway; use Tailscale IP for remote
+  url: "ws://127.0.0.1:18789"
   
   # Authentication token
   # Can use environment variable reference or hardcode

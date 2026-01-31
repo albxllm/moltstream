@@ -1,27 +1,122 @@
 package gateway
 
 import (
-	"bufio"
-	"context"
+	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"encoding/pem"
 	"fmt"
-	"os/exec"
-	"strings"
+	"log"
+	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
-// Client wraps openclaw CLI for gateway communication
 type Client struct {
-	sessionID string
-	mu        sync.Mutex
-	onMessage func(content string, done bool)
-	onError   func(err error)
+	url          string
+	token        string
+	conn         *websocket.Conn
+	mu           sync.Mutex
+	connected    bool
+	connectNonce string
+	onMessage    func(content string, done bool)
+	onError      func(err error)
+	deviceID     string
+	publicKey    string
+	privateKey   ed25519.PrivateKey
+	reqID        int
+}
+
+type DeviceIdentity struct {
+	Version       int    `json:"version"`
+	DeviceID      string `json:"deviceId"`
+	PublicKeyPem  string `json:"publicKeyPem"`
+	PrivateKeyPem string `json:"privateKeyPem"`
+}
+
+type GatewayFrame struct {
+	Type    string          `json:"type"`
+	ID      string          `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Event   string          `json:"event,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *FrameError     `json:"error,omitempty"`
+	Ok      bool            `json:"ok,omitempty"`
+}
+
+type FrameError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type ConnectChallenge struct {
+	Nonce string `json:"nonce"`
+	Ts    int64  `json:"ts"`
+}
+
+type ChatEvent struct {
+	RunID   string `json:"runId"`
+	Seq     int    `json:"seq"`
+	State   string `json:"state"`
+	Message struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text,omitempty"`
+		} `json:"content,omitempty"`
+	} `json:"message,omitempty"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
 func NewClient(url, token string) *Client {
-	// URL and token not used - we use CLI instead
-	return &Client{
-		sessionID: "moltstream",
+	c := &Client{
+		url:   url,
+		token: token,
 	}
+	c.loadDeviceIdentity()
+	return c
+}
+
+func (c *Client) loadDeviceIdentity() error {
+	home, _ := os.UserHomeDir()
+	path := filepath.Join(home, ".openclaw", "identity", "device.json")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read device identity: %w", err)
+	}
+
+	var identity DeviceIdentity
+	if err := json.Unmarshal(data, &identity); err != nil {
+		return fmt.Errorf("parse device identity: %w", err)
+	}
+
+	c.deviceID = identity.DeviceID
+	c.publicKey = identity.PublicKeyPem
+
+	block, _ := pem.Decode([]byte(identity.PrivateKeyPem))
+	if block == nil {
+		return fmt.Errorf("decode private key PEM")
+	}
+
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse private key: %w", err)
+	}
+
+	edKey, ok := key.(ed25519.PrivateKey)
+	if !ok {
+		return fmt.Errorf("not ed25519 key")
+	}
+	c.privateKey = edKey
+
+	return nil
 }
 
 func (c *Client) OnMessage(fn func(content string, done bool)) {
@@ -33,89 +128,210 @@ func (c *Client) OnError(fn func(err error)) {
 }
 
 func (c *Client) Connect() error {
-	// No persistent connection needed with CLI approach
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 10 * time.Second,
+	}
+
+	conn, _, err := dialer.Dial(c.url, http.Header{})
+	if err != nil {
+		return fmt.Errorf("websocket dial: %w", err)
+	}
+
+	c.conn = conn
+	c.connectNonce = ""
+
+	// Don't send connect yet - wait for challenge
+	go c.readLoop()
+
 	return nil
 }
 
-func (c *Client) IsConnected() bool {
-	return true // Always "connected" since we use CLI
+func (c *Client) readLoop() {
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if c.onError != nil {
+				c.onError(fmt.Errorf("read: %w", err))
+			}
+			c.mu.Lock()
+			c.connected = false
+			c.mu.Unlock()
+			return
+		}
+
+		var frame GatewayFrame
+		if err := json.Unmarshal(message, &frame); err != nil {
+			log.Printf("parse frame: %v", err)
+			continue
+		}
+
+		c.handleFrame(&frame)
+	}
+}
+
+func (c *Client) handleFrame(frame *GatewayFrame) {
+	switch frame.Type {
+	case "event":
+		c.handleEvent(frame)
+	case "res":
+		if frame.Ok {
+			// Check if this is hello-ok response
+			c.mu.Lock()
+			c.connected = true
+			c.mu.Unlock()
+			log.Printf("Connected to gateway!")
+		} else if frame.Error != nil {
+			if c.onError != nil {
+				c.onError(fmt.Errorf("gateway error: %s", frame.Error.Message))
+			}
+		}
+	}
+}
+
+func (c *Client) handleEvent(frame *GatewayFrame) {
+	log.Printf("Event: %s", frame.Event)
+	switch frame.Event {
+	case "connect.challenge":
+		c.handleChallenge(frame.Payload)
+	case "chat":
+		c.handleChatEvent(frame.Payload)
+	}
+}
+
+func (c *Client) handleChallenge(payload json.RawMessage) {
+	var challenge ConnectChallenge
+	if err := json.Unmarshal(payload, &challenge); err != nil {
+		log.Printf("parse challenge: %v", err)
+		return
+	}
+
+	log.Printf("Received challenge, sending auth connect")
+	c.connectNonce = challenge.Nonce
+	c.sendConnect()
+}
+
+func (c *Client) sendConnect() {
+	signedAt := time.Now().UnixMilli()
+	// Format: v2|deviceId|clientId|clientMode|role|scopes|signedAtMs|token|nonce
+	scopes := "operator.admin"
+	token := c.token
+	authPayload := fmt.Sprintf("v2|%s|cli|cli|operator|%s|%d|%s|%s",
+		c.deviceID, scopes, signedAt, token, c.connectNonce)
+
+	signature := ed25519.Sign(c.privateKey, []byte(authPayload))
+	sigB64 := base64.RawURLEncoding.EncodeToString(signature)
+
+	pubKeyRaw := c.privateKey.Public().(ed25519.PublicKey)
+	pubKeyB64 := base64.RawURLEncoding.EncodeToString(pubKeyRaw)
+
+	connectFrame := map[string]interface{}{
+		"type":   "req",
+		"id":     "connect",
+		"method": "connect",
+		"params": map[string]interface{}{
+			"minProtocol": 3,
+			"maxProtocol": 3,
+			"client": map[string]interface{}{
+				"id":       "cli",
+				"version":  "0.1.0",
+				"platform": "darwin",
+				"mode":     "cli",
+			},
+			"role":   "operator",
+			"scopes": []string{"operator.admin"},
+			"auth": map[string]interface{}{
+				"token": c.token,
+			},
+			"device": map[string]interface{}{
+				"id":        c.deviceID,
+				"publicKey": pubKeyB64,
+				"signature": sigB64,
+				"signedAt":  signedAt,
+				"nonce":     c.connectNonce,
+			},
+		},
+	}
+
+	log.Printf("Sending connect with device %s", c.deviceID[:16])
+	c.mu.Lock()
+	err := c.conn.WriteJSON(connectFrame)
+	c.mu.Unlock()
+
+	if err != nil {
+		log.Printf("send connect: %v", err)
+	}
+}
+
+func (c *Client) handleChatEvent(payload json.RawMessage) {
+	var event ChatEvent
+	if err := json.Unmarshal(payload, &event); err != nil {
+		log.Printf("parse chat event: %v", err)
+		return
+	}
+
+	var text string
+	if event.Message.Content != nil {
+		for _, part := range event.Message.Content {
+			if part.Type == "text" {
+				text += part.Text
+			}
+		}
+	}
+
+	done := event.State == "final" || event.State == "error" || event.State == "aborted"
+
+	if c.onMessage != nil {
+		if event.State == "error" {
+			c.onMessage(event.ErrorMessage, true)
+		} else if text != "" || done {
+			c.onMessage(text, done)
+		}
+	}
 }
 
 func (c *Client) Send(content string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 600*1000*1000*1000) // 600s
-	defer cancel()
-
-	// Use openclaw agent command
-	cmd := exec.CommandContext(ctx, "openclaw", "agent",
-		"--session-id", c.sessionID,
-		"--message", content,
-	)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
+	if !c.connected || c.conn == nil {
+		return fmt.Errorf("not connected")
 	}
 
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("stderr pipe: %w", err)
+	c.reqID++
+	frame := map[string]interface{}{
+		"type":   "req",
+		"id":     fmt.Sprintf("chat-%d", c.reqID),
+		"method": "chat.send",
+		"params": map[string]interface{}{
+			"sessionKey":     "moltstream",
+			"message":        content,
+			"idempotencyKey": fmt.Sprintf("molt-%d", time.Now().UnixNano()),
+		},
 	}
 
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("start command: %w", err)
-	}
+	return c.conn.WriteJSON(frame)
+}
 
-	// Read stdout line by line and stream to callback
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		var fullResponse strings.Builder
-		
-		for scanner.Scan() {
-			line := scanner.Text()
-			fullResponse.WriteString(line)
-			fullResponse.WriteString("\n")
-			
-			if c.onMessage != nil {
-				c.onMessage(line+"\n", false)
-			}
-		}
-		
-		// Signal completion
-		if c.onMessage != nil {
-			c.onMessage("", true)
-		}
-	}()
-
-	// Read stderr for errors
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if c.onError != nil && line != "" {
-				c.onError(fmt.Errorf("%s", line))
-			}
-		}
-	}()
-
-	// Wait for completion in background
-	go func() {
-		if err := cmd.Wait(); err != nil {
-			if c.onError != nil {
-				c.onError(fmt.Errorf("command failed: %w", err))
-			}
-		}
-	}()
-
-	return nil
+func (c *Client) IsConnected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected
 }
 
 func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn != nil {
+		return c.conn.Close()
+	}
 	return nil
 }
 
 func (c *Client) Reconnect() error {
-	return nil
+	c.Close()
+	return c.Connect()
 }
