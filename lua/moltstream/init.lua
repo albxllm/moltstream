@@ -14,6 +14,7 @@ local config = {}
 local response_in_progress = false
 local pending_response = ""
 local response_start_line = nil
+local stdout_buffer = ""   -- Buffer for partial stdout lines
 
 -- Default configuration
 local defaults = {
@@ -65,9 +66,16 @@ local function start_bridge()
 
   job_id = vim.fn.jobstart({ config.binary }, {
     on_stdout = function(_, data, _)
-      for _, line in ipairs(data) do
-        if line ~= "" then
-          handle_message(line)
+      -- Handle partial lines: data is an array where last element may be incomplete
+      -- Join with buffer from previous call
+      if #data == 0 then return end
+      data[1] = stdout_buffer .. data[1]
+      stdout_buffer = data[#data]  -- Save potentially incomplete last line
+      
+      -- Process all complete lines (all but the last)
+      for i = 1, #data - 1 do
+        if data[i] ~= "" then
+          handle_message(data[i])
         end
       end
     end,
@@ -81,6 +89,11 @@ local function start_bridge()
       end
     end,
     on_exit = function(_, code, _)
+      -- Process any remaining buffered data
+      if stdout_buffer ~= "" then
+        handle_message(stdout_buffer)
+        stdout_buffer = ""
+      end
       job_id = nil
       if code ~= 0 then
         vim.schedule(function()
