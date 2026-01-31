@@ -1,0 +1,30 @@
+# moltstream configuration
+# Copy to ~/.config/moltstream/config.yaml
+
+gateway:
+  # OpenClaw gateway WebSocket URL
+  # Replace with your Tailscale IP if different
+  url: "ws://100.104.217.17:3000/api/sessions/main/ws"
+  
+  # Authentication token
+  # Can use environment variable reference or hardcode
+  token: "${OPENCLAW_TOKEN}"
+
+session:
+  # Where to store session files
+  directory: "~/.local/share/moltstream"
+  
+  # Maximum session file size before auto-archiving (bytes)
+  # Default: 1GB
+  max_size_bytes: 1073741824
+  
+  # Automatically archive when max size reached
+  auto_archive: true
+
+# Optional: Neovim plugin settings (can also be set in nvim config)
+neovim:
+  # Automatically scroll to bottom on new response
+  scroll_on_response: true
+  
+  # User name shown in session (default: User)
+  user_name: "Alex"
