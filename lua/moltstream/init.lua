@@ -2,6 +2,7 @@
 -- Real-time bidirectional communication with OpenClaw
 
 local M = {}
+local git = require("moltstream.git")
 
 -- State
 local job_id = nil
@@ -13,12 +14,26 @@ local config = {}
 local response_in_progress = false
 local pending_response = ""
 local response_start_line = nil
+local stdout_buffer = ""   -- Buffer for partial stdout lines
+
+-- Helper to set buffer lines with undo support
+local function buf_set_lines_undoable(buf, start_line, end_line, lines)
+  vim.api.nvim_buf_call(buf, function()
+    -- Save cursor
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    -- Use normal buffer modification for undo support
+    vim.api.nvim_buf_set_lines(buf, start_line, end_line, false, lines)
+    -- Restore cursor if valid
+    pcall(vim.api.nvim_win_set_cursor, 0, cursor)
+  end)
+end
 
 -- Default configuration
 local defaults = {
   binary = "moltstream",
   keymap = {
     send = "<leader>ms",
+    send_code = "<leader>mc",  -- Send code with git context
     open = "<leader>mo",
     history = "<leader>mu",
   },
@@ -32,18 +47,24 @@ function M.setup(opts)
 
   -- Create commands
   vim.api.nvim_create_user_command("MoltOpen", M.open, {})
+  vim.api.nvim_create_user_command("MoltClose", M.close, {})
+  vim.api.nvim_create_user_command("MoltToggle", M.toggle, {})
+  vim.api.nvim_create_user_command("MoltClear", M.clear, {})
   vim.api.nvim_create_user_command("MoltSend", M.send_visual, {})
+  vim.api.nvim_create_user_command("MoltSendCode", M.send_code, {})
   vim.api.nvim_create_user_command("MoltHistory", M.fetch_history, {})
   vim.api.nvim_create_user_command("MoltStatus", M.status, {})
-  vim.api.nvim_create_user_command("MoltClose", M.close, {})
 
   -- Setup keymaps
   if config.keymap.open then
-    vim.keymap.set("n", config.keymap.open, M.open, { desc = "Moltstream: Open" })
+    vim.keymap.set("n", config.keymap.open, M.toggle, { desc = "Moltstream: Toggle" })
   end
   if config.keymap.send then
     vim.keymap.set("v", config.keymap.send, M.send_visual, { desc = "Moltstream: Send selection" })
     vim.keymap.set("n", config.keymap.send, M.send_line, { desc = "Moltstream: Send line/paragraph" })
+  end
+  if config.keymap.send_code then
+    vim.keymap.set("v", config.keymap.send_code, M.send_code, { desc = "Moltstream: Send code with git context" })
   end
   if config.keymap.history then
     vim.keymap.set("n", config.keymap.history, M.fetch_history, { desc = "Moltstream: Fetch history" })
@@ -58,9 +79,16 @@ local function start_bridge()
 
   job_id = vim.fn.jobstart({ config.binary }, {
     on_stdout = function(_, data, _)
-      for _, line in ipairs(data) do
-        if line ~= "" then
-          handle_message(line)
+      -- Handle partial lines: data is an array where last element may be incomplete
+      -- Join with buffer from previous call
+      if #data == 0 then return end
+      data[1] = stdout_buffer .. data[1]
+      stdout_buffer = data[#data]  -- Save potentially incomplete last line
+      
+      -- Process all complete lines (all but the last)
+      for i = 1, #data - 1 do
+        if data[i] ~= "" then
+          handle_message(data[i])
         end
       end
     end,
@@ -74,6 +102,11 @@ local function start_bridge()
       end
     end,
     on_exit = function(_, code, _)
+      -- Process any remaining buffered data
+      if stdout_buffer ~= "" then
+        handle_message(stdout_buffer)
+        stdout_buffer = ""
+      end
       job_id = nil
       if code ~= 0 then
         vim.schedule(function()
@@ -153,11 +186,13 @@ local function ensure_agent_buf()
     return agent_buf
   end
 
-  agent_buf = vim.api.nvim_create_buf(false, true)
+  agent_buf = vim.api.nvim_create_buf(true, false)  -- listed, not scratch
   vim.api.nvim_buf_set_name(agent_buf, "[Moltstream Agent]")
   vim.bo[agent_buf].filetype = "markdown"
-  vim.bo[agent_buf].buftype = "nofile"
+  vim.bo[agent_buf].buftype = ""  -- Regular buffer for undo support
+  vim.bo[agent_buf].bufhidden = "hide"
   vim.bo[agent_buf].swapfile = false
+  vim.bo[agent_buf].modifiable = true
   
   -- Add header
   vim.api.nvim_buf_set_lines(agent_buf, 0, -1, false, {
@@ -326,6 +361,48 @@ function M.close()
   user_win = nil
 end
 
+-- Check if layout is open
+function M.is_open()
+  return (agent_win and vim.api.nvim_win_is_valid(agent_win))
+      or (user_win and vim.api.nvim_win_is_valid(user_win))
+end
+
+-- Toggle the moltstream layout
+function M.toggle()
+  if M.is_open() then
+    M.close()
+  else
+    M.open()
+  end
+end
+
+-- Clear/reset everything (use when state gets broken)
+function M.clear()
+  -- Reset all state
+  response_in_progress = false
+  pending_response = ""
+  response_start_line = nil
+  stdout_buffer = ""
+  
+  -- Reset agent buffer
+  if agent_buf and vim.api.nvim_buf_is_valid(agent_buf) then
+    vim.api.nvim_buf_set_lines(agent_buf, 0, -1, false, {
+      "# Agent Responses",
+      "",
+    })
+  end
+  
+  -- Reset user buffer
+  if user_buf and vim.api.nvim_buf_is_valid(user_buf) then
+    vim.api.nvim_buf_set_lines(user_buf, 0, -1, false, {
+      "# Message History",
+      "",
+    })
+  end
+  
+  vim.notify("[moltstream] State cleared", vim.log.levels.INFO)
+end
+
 -- Send selected text in visual mode
 function M.send_visual()
   -- Get visual selection
@@ -370,6 +447,46 @@ function M.send_line()
   end
   
   M.send_message(line)
+end
+
+-- Send code with git context (for PR workflows)
+function M.send_code()
+  -- Get visual selection
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  local start_line, end_line = start_pos[2], end_pos[2]
+  local lines = vim.fn.getline(start_line, end_line)
+  
+  if #lines == 0 then
+    vim.notify("[moltstream] No code selected", vim.log.levels.WARN)
+    return
+  end
+  
+  -- Handle partial line selection
+  local start_col, end_col = start_pos[3], end_pos[3]
+  if #lines == 1 then
+    lines[1] = string.sub(lines[1], start_col, end_col)
+  else
+    lines[1] = string.sub(lines[1], start_col)
+    lines[#lines] = string.sub(lines[#lines], 1, end_col)
+  end
+  
+  local code = table.concat(lines, "\n")
+  local filepath = vim.fn.expand("%:p")
+  
+  -- Get git metadata
+  local meta = git.get_metadata(filepath, start_line, end_line)
+  local context = git.format_context(meta, code)
+  
+  -- Add task instruction based on git status
+  local instruction
+  if meta.is_git and meta.remote_url then
+    instruction = "\n\n**Task:** Please review this code and suggest improvements. If changes are needed, you can create a PR to `" .. (meta.repo or "the repo") .. "`."
+  else
+    instruction = "\n\n**Task:** Please review this code and suggest improvements. Note: This is not in a git repo I can access, so please provide the changes as a diff or updated code block."
+  end
+  
+  M.send_message(context .. instruction)
 end
 
 -- Send any message string

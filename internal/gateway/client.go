@@ -18,18 +18,20 @@ import (
 )
 
 type Client struct {
-	url          string
-	token        string
-	conn         *websocket.Conn
-	mu           sync.Mutex
-	connected    bool
-	connectNonce string
-	onMessage    func(content string, done bool)
-	onError      func(err error)
-	deviceID     string
-	publicKey    string
-	privateKey   ed25519.PrivateKey
-	reqID        int
+	url           string
+	token         string
+	conn          *websocket.Conn
+	mu            sync.Mutex
+	connected     bool
+	connectNonce  string
+	onMessage     func(content string, done bool)
+	onError       func(err error)
+	deviceID      string
+	publicKey     string
+	privateKey    ed25519.PrivateKey
+	reqID         int
+	activeRunID   string // Track our active request's runId
+	lastContent   string // Track last content to compute deltas
 }
 
 type DeviceIdentity struct {
@@ -177,12 +179,12 @@ func (c *Client) handleFrame(frame *GatewayFrame) {
 	case "event":
 		c.handleEvent(frame)
 	case "res":
+		log.Printf("response: id=%s ok=%v", frame.ID, frame.Ok)
 		if frame.Ok {
-			// Check if this is hello-ok response
+			// Mark connected on successful connect
 			c.mu.Lock()
 			c.connected = true
 			c.mu.Unlock()
-			log.Printf("Connected to gateway!")
 		} else if frame.Error != nil {
 			log.Printf("Gateway error: code=%v message=%s", frame.Error.Code, frame.Error.Message)
 			if c.onError != nil {
@@ -273,22 +275,55 @@ func (c *Client) handleChatEvent(payload json.RawMessage) {
 		return
 	}
 
-	var text string
+	// Filter: only process events for our active request
+	c.mu.Lock()
+	activeRunID := c.activeRunID
+	lastContent := c.lastContent
+	c.mu.Unlock()
+
+	log.Printf("chat event: runId=%s state=%s (tracking=%s)", event.RunID, event.State, activeRunID)
+
+	if activeRunID == "" || event.RunID != activeRunID {
+		// Ignore events from other sessions/requests
+		log.Printf("ignoring event (runId mismatch or no active request)")
+		return
+	}
+
+	var fullText string
 	if event.Message.Content != nil {
 		for _, part := range event.Message.Content {
 			if part.Type == "text" {
-				text += part.Text
+				fullText += part.Text
 			}
 		}
 	}
 
+	// Compute delta (gateway sends accumulated content, we want incremental)
+	delta := ""
+	if len(fullText) > len(lastContent) {
+		delta = fullText[len(lastContent):]
+	}
+
+	// Update last content
+	c.mu.Lock()
+	c.lastContent = fullText
+	c.mu.Unlock()
+
 	done := event.State == "final" || event.State == "error" || event.State == "aborted"
+
+	if done {
+		// Clear active run
+		c.mu.Lock()
+		c.activeRunID = ""
+		c.lastContent = ""
+		c.mu.Unlock()
+	}
 
 	if c.onMessage != nil {
 		if event.State == "error" {
 			c.onMessage(event.ErrorMessage, true)
-		} else if text != "" || done {
-			c.onMessage(text, done)
+		} else if delta != "" || done {
+			c.onMessage(delta, done)
 		}
 	}
 }
@@ -302,17 +337,25 @@ func (c *Client) Send(content string) error {
 	}
 
 	c.reqID++
+	reqID := fmt.Sprintf("chat-%d", c.reqID)
+	idempotencyKey := fmt.Sprintf("molt-%d", time.Now().UnixNano())
+	
+	// Gateway uses idempotencyKey as runId, so track it now
+	c.activeRunID = idempotencyKey
+	c.lastContent = ""
+	
 	frame := map[string]interface{}{
 		"type":   "req",
-		"id":     fmt.Sprintf("chat-%d", c.reqID),
+		"id":     reqID,
 		"method": "chat.send",
 		"params": map[string]interface{}{
-			"sessionKey":     "moltstream",
+			"sessionKey":     "main",
 			"message":        content,
-			"idempotencyKey": fmt.Sprintf("molt-%d", time.Now().UnixNano()),
+			"idempotencyKey": idempotencyKey,
 		},
 	}
 
+	log.Printf("sending chat.send id=%s, tracking runId=%s", reqID, idempotencyKey)
 	return c.conn.WriteJSON(frame)
 }
 
