@@ -179,9 +179,10 @@ func (c *Client) handleFrame(frame *GatewayFrame) {
 	case "event":
 		c.handleEvent(frame)
 	case "res":
+		log.Printf("response: id=%s ok=%v result=%s", frame.ID, frame.Ok, string(frame.Result))
 		if frame.Ok {
 			// Check if this is a chat.send response with runId
-			if frame.ID != "" && len(frame.ID) > 5 && frame.ID[:5] == "chat-" {
+			if frame.ID != "" && len(frame.ID) >= 5 && frame.ID[:5] == "chat-" {
 				var result struct {
 					RunID string `json:"runId"`
 				}
@@ -191,6 +192,8 @@ func (c *Client) handleFrame(frame *GatewayFrame) {
 					c.lastContent = ""
 					c.mu.Unlock()
 					log.Printf("Tracking runId: %s", result.RunID)
+				} else {
+					log.Printf("failed to extract runId: %v", err)
 				}
 			}
 			// Mark connected on successful connect
@@ -293,8 +296,11 @@ func (c *Client) handleChatEvent(payload json.RawMessage) {
 	lastContent := c.lastContent
 	c.mu.Unlock()
 
+	log.Printf("chat event: runId=%s state=%s (tracking=%s)", event.RunID, event.State, activeRunID)
+
 	if activeRunID == "" || event.RunID != activeRunID {
 		// Ignore events from other sessions/requests
+		log.Printf("ignoring event (runId mismatch or no active request)")
 		return
 	}
 
@@ -346,17 +352,19 @@ func (c *Client) Send(content string) error {
 	}
 
 	c.reqID++
+	reqID := fmt.Sprintf("chat-%d", c.reqID)
 	frame := map[string]interface{}{
 		"type":   "req",
-		"id":     fmt.Sprintf("chat-%d", c.reqID),
+		"id":     reqID,
 		"method": "chat.send",
 		"params": map[string]interface{}{
-			"sessionKey":     "moltstream",
+			"sessionKey":     "main",
 			"message":        content,
 			"idempotencyKey": fmt.Sprintf("molt-%d", time.Now().UnixNano()),
 		},
 	}
 
+	log.Printf("sending chat.send with id=%s", reqID)
 	return c.conn.WriteJSON(frame)
 }
 
