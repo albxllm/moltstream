@@ -16,6 +16,18 @@ local pending_response = ""
 local response_start_line = nil
 local stdout_buffer = ""   -- Buffer for partial stdout lines
 
+-- Helper to set buffer lines with undo support
+local function buf_set_lines_undoable(buf, start_line, end_line, lines)
+  vim.api.nvim_buf_call(buf, function()
+    -- Save cursor
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    -- Use normal buffer modification for undo support
+    vim.api.nvim_buf_set_lines(buf, start_line, end_line, false, lines)
+    -- Restore cursor if valid
+    pcall(vim.api.nvim_win_set_cursor, 0, cursor)
+  end)
+end
+
 -- Default configuration
 local defaults = {
   binary = "moltstream",
@@ -174,11 +186,13 @@ local function ensure_agent_buf()
     return agent_buf
   end
 
-  agent_buf = vim.api.nvim_create_buf(false, true)
+  agent_buf = vim.api.nvim_create_buf(true, false)  -- listed, not scratch
   vim.api.nvim_buf_set_name(agent_buf, "[Moltstream Agent]")
   vim.bo[agent_buf].filetype = "markdown"
-  vim.bo[agent_buf].buftype = "nofile"
+  vim.bo[agent_buf].buftype = ""  -- Regular buffer for undo support
+  vim.bo[agent_buf].bufhidden = "hide"
   vim.bo[agent_buf].swapfile = false
+  vim.bo[agent_buf].modifiable = true
   
   -- Add header
   vim.api.nvim_buf_set_lines(agent_buf, 0, -1, false, {
