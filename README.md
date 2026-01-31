@@ -52,7 +52,7 @@ cp config.example.yaml ~/.config/moltstream/config.yaml
 ```yaml
 # ~/.config/moltstream/config.yaml
 gateway:
-  url: "ws://100.104.217.17:3000/api/sessions/main/ws"
+  url: "ws://<tailscale-ip>:3000/api/sessions/main/ws"
   token: "${OPENCLAW_TOKEN}"  # Or hardcode
 
 session:
@@ -246,7 +246,7 @@ make lint
 
 ### Connection refused
 ```
-Error: dial tcp 100.104.217.17:3000: connect: connection refused
+Error: dial tcp <tailscale-ip>:3000: connect: connection refused
 ```
 → Ensure OpenClaw gateway is running: `openclaw gateway status`
 
