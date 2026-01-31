@@ -43,6 +43,7 @@ function M.setup(opts)
   end
   if config.keymap.send then
     vim.keymap.set("n", config.keymap.send, M.send, { desc = "Moltstream: Send" })
+    vim.keymap.set("v", config.keymap.send, M.send_visual, { desc = "Moltstream: Send selection" })
   end
   if config.keymap.new_message then
     vim.keymap.set("n", config.keymap.new_message, M.new_message, { desc = "Moltstream: New message" })
@@ -313,16 +314,37 @@ function M.send()
     return
   end
 
+  M.send_message(message)
+end
+
+-- Send selected text in visual mode
+function M.send_visual()
+  -- Exit visual mode and get selection
+  vim.cmd('normal! "vy')
+  local message = vim.fn.getreg("v")
+  
+  if not message or message == "" then
+    vim.notify("[moltstream] No text selected", vim.log.levels.WARN)
+    return
+  end
+
+  M.send_message(message)
+end
+
+-- Send any message string
+function M.send_message(message)
   if response_in_progress then
     vim.notify("[moltstream] Response in progress", vim.log.levels.WARN)
     return
   end
 
-  -- Save buffer first
-  if session_buf and vim.api.nvim_buf_is_valid(session_buf) then
-    vim.api.nvim_buf_call(session_buf, function()
-      vim.cmd("silent write")
-    end)
+  if not start_bridge() then
+    return
+  end
+
+  -- Set current buffer as session buffer if not set
+  if not session_buf or not vim.api.nvim_buf_is_valid(session_buf) then
+    session_buf = vim.api.nvim_get_current_buf()
   end
 
   rpc_request("send", { content = message })
