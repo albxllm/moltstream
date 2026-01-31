@@ -34,15 +34,16 @@ function M.setup(opts)
 
   -- Create commands
   vim.api.nvim_create_user_command("MoltOpen", M.open, {})
+  vim.api.nvim_create_user_command("MoltClose", M.close, {})
+  vim.api.nvim_create_user_command("MoltToggle", M.toggle, {})
   vim.api.nvim_create_user_command("MoltSend", M.send_visual, {})
   vim.api.nvim_create_user_command("MoltSendCode", M.send_code, {})
   vim.api.nvim_create_user_command("MoltHistory", M.fetch_history, {})
   vim.api.nvim_create_user_command("MoltStatus", M.status, {})
-  vim.api.nvim_create_user_command("MoltClose", M.close, {})
 
   -- Setup keymaps
   if config.keymap.open then
-    vim.keymap.set("n", config.keymap.open, M.open, { desc = "Moltstream: Open" })
+    vim.keymap.set("n", config.keymap.open, M.toggle, { desc = "Moltstream: Toggle" })
   end
   if config.keymap.send then
     vim.keymap.set("v", config.keymap.send, M.send_visual, { desc = "Moltstream: Send selection" })
@@ -330,6 +331,21 @@ function M.close()
   end
   agent_win = nil
   user_win = nil
+end
+
+-- Check if layout is open
+function M.is_open()
+  return (agent_win and vim.api.nvim_win_is_valid(agent_win))
+      or (user_win and vim.api.nvim_win_is_valid(user_win))
+end
+
+-- Toggle the moltstream layout
+function M.toggle()
+  if M.is_open() then
+    M.close()
+  else
+    M.open()
+  end
 end
 
 -- Send selected text in visual mode
