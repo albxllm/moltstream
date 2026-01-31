@@ -18,18 +18,20 @@ import (
 )
 
 type Client struct {
-	url          string
-	token        string
-	conn         *websocket.Conn
-	mu           sync.Mutex
-	connected    bool
-	connectNonce string
-	onMessage    func(content string, done bool)
-	onError      func(err error)
-	deviceID     string
-	publicKey    string
-	privateKey   ed25519.PrivateKey
-	reqID        int
+	url           string
+	token         string
+	conn          *websocket.Conn
+	mu            sync.Mutex
+	connected     bool
+	connectNonce  string
+	onMessage     func(content string, done bool)
+	onError       func(err error)
+	deviceID      string
+	publicKey     string
+	privateKey    ed25519.PrivateKey
+	reqID         int
+	activeRunID   string // Track our active request's runId
+	lastContent   string // Track last content to compute deltas
 }
 
 type DeviceIdentity struct {
@@ -178,11 +180,23 @@ func (c *Client) handleFrame(frame *GatewayFrame) {
 		c.handleEvent(frame)
 	case "res":
 		if frame.Ok {
-			// Check if this is hello-ok response
+			// Check if this is a chat.send response with runId
+			if frame.ID != "" && len(frame.ID) > 5 && frame.ID[:5] == "chat-" {
+				var result struct {
+					RunID string `json:"runId"`
+				}
+				if err := json.Unmarshal(frame.Result, &result); err == nil && result.RunID != "" {
+					c.mu.Lock()
+					c.activeRunID = result.RunID
+					c.lastContent = ""
+					c.mu.Unlock()
+					log.Printf("Tracking runId: %s", result.RunID)
+				}
+			}
+			// Mark connected on successful connect
 			c.mu.Lock()
 			c.connected = true
 			c.mu.Unlock()
-			log.Printf("Connected to gateway!")
 		} else if frame.Error != nil {
 			log.Printf("Gateway error: code=%v message=%s", frame.Error.Code, frame.Error.Message)
 			if c.onError != nil {
@@ -273,22 +287,52 @@ func (c *Client) handleChatEvent(payload json.RawMessage) {
 		return
 	}
 
-	var text string
+	// Filter: only process events for our active request
+	c.mu.Lock()
+	activeRunID := c.activeRunID
+	lastContent := c.lastContent
+	c.mu.Unlock()
+
+	if activeRunID == "" || event.RunID != activeRunID {
+		// Ignore events from other sessions/requests
+		return
+	}
+
+	var fullText string
 	if event.Message.Content != nil {
 		for _, part := range event.Message.Content {
 			if part.Type == "text" {
-				text += part.Text
+				fullText += part.Text
 			}
 		}
 	}
 
+	// Compute delta (gateway sends accumulated content, we want incremental)
+	delta := ""
+	if len(fullText) > len(lastContent) {
+		delta = fullText[len(lastContent):]
+	}
+
+	// Update last content
+	c.mu.Lock()
+	c.lastContent = fullText
+	c.mu.Unlock()
+
 	done := event.State == "final" || event.State == "error" || event.State == "aborted"
+
+	if done {
+		// Clear active run
+		c.mu.Lock()
+		c.activeRunID = ""
+		c.lastContent = ""
+		c.mu.Unlock()
+	}
 
 	if c.onMessage != nil {
 		if event.State == "error" {
 			c.onMessage(event.ErrorMessage, true)
-		} else if text != "" || done {
-			c.onMessage(text, done)
+		} else if delta != "" || done {
+			c.onMessage(delta, done)
 		}
 	}
 }
