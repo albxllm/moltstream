@@ -5,24 +5,25 @@ local M = {}
 
 -- State
 local job_id = nil
-local session_buf = nil
+local agent_buf = nil      -- Buffer for agent responses
+local user_buf = nil       -- Buffer for user message history
+local agent_win = nil      -- Window for agent responses
+local user_win = nil       -- Window for user messages
 local config = {}
 local response_in_progress = false
 local pending_response = ""
-local response_start_line = nil  -- Track where response content begins
+local response_start_line = nil
 
 -- Default configuration
 local defaults = {
   binary = "moltstream",
   keymap = {
     send = "<leader>ms",
-    new_message = "<leader>mn",
     open = "<leader>mo",
-    archive = "<leader>ma",
+    history = "<leader>mu",
   },
   auto_scroll = true,
-  max_file_size = 1024 * 1024 * 1024, -- 1GB
-  user_name = "User",
+  split_width = 80,  -- Width of the right split
 }
 
 -- Setup function
@@ -31,25 +32,21 @@ function M.setup(opts)
 
   -- Create commands
   vim.api.nvim_create_user_command("MoltOpen", M.open, {})
-  vim.api.nvim_create_user_command("MoltSend", M.send, {})
-  vim.api.nvim_create_user_command("MoltNew", M.new_message, {})
-  vim.api.nvim_create_user_command("MoltArchive", M.archive, {})
+  vim.api.nvim_create_user_command("MoltSend", M.send_visual, {})
+  vim.api.nvim_create_user_command("MoltHistory", M.fetch_history, {})
   vim.api.nvim_create_user_command("MoltStatus", M.status, {})
-  vim.api.nvim_create_user_command("MoltReconnect", M.reconnect, {})
+  vim.api.nvim_create_user_command("MoltClose", M.close, {})
 
   -- Setup keymaps
   if config.keymap.open then
     vim.keymap.set("n", config.keymap.open, M.open, { desc = "Moltstream: Open" })
   end
   if config.keymap.send then
-    vim.keymap.set("n", config.keymap.send, M.send, { desc = "Moltstream: Send" })
     vim.keymap.set("v", config.keymap.send, M.send_visual, { desc = "Moltstream: Send selection" })
+    vim.keymap.set("n", config.keymap.send, M.send_line, { desc = "Moltstream: Send line/paragraph" })
   end
-  if config.keymap.new_message then
-    vim.keymap.set("n", config.keymap.new_message, M.new_message, { desc = "Moltstream: New message" })
-  end
-  if config.keymap.archive then
-    vim.keymap.set("n", config.keymap.archive, M.archive, { desc = "Moltstream: Archive" })
+  if config.keymap.history then
+    vim.keymap.set("n", config.keymap.history, M.fetch_history, { desc = "Moltstream: Fetch history" })
   end
 end
 
@@ -70,14 +67,18 @@ local function start_bridge()
     on_stderr = function(_, data, _)
       for _, line in ipairs(data) do
         if line ~= "" then
-          vim.notify("[moltstream] " .. line, vim.log.levels.WARN)
+          vim.schedule(function()
+            vim.notify("[moltstream] " .. line, vim.log.levels.WARN)
+          end)
         end
       end
     end,
     on_exit = function(_, code, _)
       job_id = nil
       if code ~= 0 then
-        vim.notify("[moltstream] Bridge exited with code " .. code, vim.log.levels.ERROR)
+        vim.schedule(function()
+          vim.notify("[moltstream] Bridge exited with code " .. code, vim.log.levels.ERROR)
+        end)
       end
     end,
     stdin = "pipe",
@@ -94,7 +95,7 @@ local function start_bridge()
 end
 
 -- Send RPC request to bridge
-local function rpc_request(method, params, callback)
+local function rpc_request(method, params)
   if not start_bridge() then
     return
   end
@@ -121,9 +122,15 @@ function handle_message(line)
     if msg.method == "stream" then
       handle_stream(msg.params)
     elseif msg.method == "connected" then
-      vim.notify("[moltstream] Connected to gateway", vim.log.levels.INFO)
+      vim.schedule(function()
+        vim.notify("[moltstream] Connected to gateway", vim.log.levels.INFO)
+      end)
     elseif msg.method == "error" then
-      vim.notify("[moltstream] Error: " .. (msg.params.message or "unknown"), vim.log.levels.ERROR)
+      vim.schedule(function()
+        vim.notify("[moltstream] Error: " .. (msg.params.message or "unknown"), vim.log.levels.ERROR)
+      end)
+    elseif msg.method == "history" then
+      handle_history(msg.params)
     end
     return
   end
@@ -132,22 +139,63 @@ function handle_message(line)
   if msg.result then
     if msg.result.status == "ok" then
       finalize_response()
-    elseif msg.result.path then
-      open_session_file(msg.result.path)
     end
   elseif msg.error then
-    vim.notify("[moltstream] " .. msg.error.message, vim.log.levels.ERROR)
+    vim.schedule(function()
+      vim.notify("[moltstream] " .. (msg.error.message or "unknown error"), vim.log.levels.ERROR)
+    end)
   end
+end
+
+-- Create or get the agent buffer
+local function ensure_agent_buf()
+  if agent_buf and vim.api.nvim_buf_is_valid(agent_buf) then
+    return agent_buf
+  end
+
+  agent_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(agent_buf, "[Moltstream Agent]")
+  vim.bo[agent_buf].filetype = "markdown"
+  vim.bo[agent_buf].buftype = "nofile"
+  vim.bo[agent_buf].swapfile = false
+  
+  -- Add header
+  vim.api.nvim_buf_set_lines(agent_buf, 0, -1, false, {
+    "# Agent Responses",
+    "",
+  })
+  
+  return agent_buf
+end
+
+-- Create or get the user buffer
+local function ensure_user_buf()
+  if user_buf and vim.api.nvim_buf_is_valid(user_buf) then
+    return user_buf
+  end
+
+  user_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(user_buf, "[Moltstream History]")
+  vim.bo[user_buf].filetype = "markdown"
+  vim.bo[user_buf].buftype = "nofile"
+  vim.bo[user_buf].swapfile = false
+  
+  -- Add header
+  vim.api.nvim_buf_set_lines(user_buf, 0, -1, false, {
+    "# Message History",
+    "",
+    "Press <leader>mu to fetch history",
+    "",
+  })
+  
+  return user_buf
 end
 
 -- Handle streaming response
 function handle_stream(params)
-  if not session_buf or not vim.api.nvim_buf_is_valid(session_buf) then
-    return
-  end
-
-  -- Schedule on main thread to avoid race conditions
   vim.schedule(function()
+    local buf = ensure_agent_buf()
+    
     -- Start new response block if needed
     if not response_in_progress then
       response_in_progress = true
@@ -155,16 +203,15 @@ function handle_stream(params)
       
       -- Insert response header
       local timestamp = os.date("%H:%M")
+      local line_count = vim.api.nvim_buf_line_count(buf)
       local header = {
-        "",
         "---",
         "",
-        "## Assistant [" .. timestamp .. "]",
+        "## [" .. timestamp .. "]",
         "",
       }
-      vim.api.nvim_buf_set_lines(session_buf, -1, -1, false, header)
-      -- Store the line where content will start (0-indexed)
-      response_start_line = vim.api.nvim_buf_line_count(session_buf)
+      vim.api.nvim_buf_set_lines(buf, line_count, line_count, false, header)
+      response_start_line = vim.api.nvim_buf_line_count(buf)
     end
 
     -- Append delta
@@ -174,38 +221,48 @@ function handle_stream(params)
       -- Update buffer with current response
       local lines = vim.split(pending_response, "\n", { plain = true })
       
-      -- Replace from stored start line to end
       if response_start_line then
-        vim.api.nvim_buf_set_lines(session_buf, response_start_line, -1, false, lines)
+        vim.api.nvim_buf_set_lines(buf, response_start_line, -1, false, lines)
       end
       
-      -- Auto-scroll
-      if config.auto_scroll then
-        local win = find_buffer_window(session_buf)
-        if win then
-          local new_line_count = vim.api.nvim_buf_line_count(session_buf)
-          vim.api.nvim_win_set_cursor(win, { new_line_count, 0 })
-        end
+      -- Auto-scroll agent window
+      if config.auto_scroll and agent_win and vim.api.nvim_win_is_valid(agent_win) then
+        local new_line_count = vim.api.nvim_buf_line_count(buf)
+        vim.api.nvim_win_set_cursor(agent_win, { new_line_count, 0 })
       end
     end
   end)
 end
 
--- Find the content line after last Assistant header
-function find_last_assistant_content_line()
-  if not session_buf then return nil end
-  
-  local lines = vim.api.nvim_buf_get_lines(session_buf, 0, -1, false)
-  local last_header = nil
-  
-  for i = #lines, 1, -1 do
-    if lines[i]:match("^## Assistant") then
-      -- Return the line after the empty line after header
-      return i + 1
+-- Handle history response
+function handle_history(params)
+  vim.schedule(function()
+    local buf = ensure_user_buf()
+    
+    local lines = {
+      "# Message History",
+      "",
+    }
+    
+    if params.messages then
+      for _, msg in ipairs(params.messages) do
+        table.insert(lines, "---")
+        table.insert(lines, "")
+        table.insert(lines, "## " .. (msg.role or "user") .. " [" .. (msg.timestamp or "") .. "]")
+        table.insert(lines, "")
+        if msg.content then
+          for _, line in ipairs(vim.split(msg.content, "\n", { plain = true })) do
+            table.insert(lines, line)
+          end
+        end
+        table.insert(lines, "")
+      end
+    else
+      table.insert(lines, "_No history available_")
     end
-  end
-  
-  return #lines
+    
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  end)
 end
 
 -- Finalize the response
@@ -214,121 +271,105 @@ function finalize_response()
   pending_response = ""
   response_start_line = nil
   
-  if session_buf and vim.api.nvim_buf_is_valid(session_buf) then
-    -- Add trailing newline and separator
-    vim.api.nvim_buf_set_lines(session_buf, -1, -1, false, { "", "" })
-    
-    -- Save the buffer
-    local bufname = vim.api.nvim_buf_get_name(session_buf)
-    if bufname ~= "" then
-      vim.api.nvim_buf_call(session_buf, function()
-        vim.cmd("silent write")
-      end)
+  vim.schedule(function()
+    if agent_buf and vim.api.nvim_buf_is_valid(agent_buf) then
+      vim.api.nvim_buf_set_lines(agent_buf, -1, -1, false, { "", "" })
     end
-  end
+  end)
 end
 
--- Find window displaying buffer
-function find_buffer_window(buf)
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_get_buf(win) == buf then
-      return win
-    end
-  end
-  return nil
-end
-
--- Open session file
-function open_session_file(path)
-  vim.cmd("edit " .. path)
-  session_buf = vim.api.nvim_get_current_buf()
-  
-  -- Set buffer options
-  vim.bo[session_buf].filetype = "markdown"
-  
-  -- Go to end
-  vim.cmd("normal! G")
-end
-
--- Extract last user message from buffer
-local function extract_last_message()
-  if not session_buf or not vim.api.nvim_buf_is_valid(session_buf) then
-    return nil
-  end
-
-  local lines = vim.api.nvim_buf_get_lines(session_buf, 0, -1, false)
-  local in_user_block = false
-  local message_lines = {}
-  local last_user_start = nil
-
-  -- Find the last User block
-  for i = #lines, 1, -1 do
-    local line = lines[i]
-    if line:match("^## " .. config.user_name) then
-      last_user_start = i
-      break
-    end
-  end
-
-  if not last_user_start then
-    return nil
-  end
-
-  -- Extract content from that block
-  for i = last_user_start + 1, #lines do
-    local line = lines[i]
-    if line:match("^---$") or line:match("^## ") then
-      break
-    end
-    table.insert(message_lines, line)
-  end
-
-  -- Trim empty lines
-  while #message_lines > 0 and message_lines[1] == "" do
-    table.remove(message_lines, 1)
-  end
-  while #message_lines > 0 and message_lines[#message_lines] == "" do
-    table.remove(message_lines)
-  end
-
-  if #message_lines == 0 then
-    return nil
-  end
-
-  return table.concat(message_lines, "\n")
-end
-
--- Public API
-
+-- Open the moltstream layout
 function M.open()
   if not start_bridge() then
     return
   end
-  rpc_request("session_path", {})
+
+  -- Create buffers
+  ensure_agent_buf()
+  ensure_user_buf()
+
+  -- Create vertical split on the right
+  vim.cmd("vsplit")
+  vim.cmd("wincmd l")
+  
+  -- Set width
+  vim.cmd("vertical resize " .. config.split_width)
+  
+  -- Show agent buffer in top
+  vim.api.nvim_win_set_buf(0, agent_buf)
+  agent_win = vim.api.nvim_get_current_win()
+  
+  -- Create horizontal split for user history
+  vim.cmd("split")
+  vim.cmd("wincmd j")
+  vim.api.nvim_win_set_buf(0, user_buf)
+  user_win = vim.api.nvim_get_current_win()
+  
+  -- Resize to give more space to agent
+  vim.cmd("resize 10")
+  
+  -- Go back to original window
+  vim.cmd("wincmd h")
+  
+  vim.notify("[moltstream] Layout opened. Use <leader>ms to send selection.", vim.log.levels.INFO)
 end
 
-function M.send()
-  local message = extract_last_message()
-  if not message then
-    vim.notify("[moltstream] No message to send", vim.log.levels.WARN)
-    return
+-- Close the moltstream layout
+function M.close()
+  if agent_win and vim.api.nvim_win_is_valid(agent_win) then
+    vim.api.nvim_win_close(agent_win, true)
   end
-
-  M.send_message(message)
+  if user_win and vim.api.nvim_win_is_valid(user_win) then
+    vim.api.nvim_win_close(user_win, true)
+  end
+  agent_win = nil
+  user_win = nil
 end
 
 -- Send selected text in visual mode
 function M.send_visual()
-  -- Exit visual mode and get selection
-  vim.cmd('normal! "vy')
-  local message = vim.fn.getreg("v")
+  -- Get visual selection
+  local start_pos = vim.fn.getpos("'<")
+  local end_pos = vim.fn.getpos("'>")
+  local lines = vim.fn.getline(start_pos[2], end_pos[2])
   
-  if not message or message == "" then
+  if #lines == 0 then
     vim.notify("[moltstream] No text selected", vim.log.levels.WARN)
     return
   end
-
+  
+  -- Handle partial line selection
+  if #lines == 1 then
+    lines[1] = string.sub(lines[1], start_pos[3], end_pos[3])
+  else
+    lines[1] = string.sub(lines[1], start_pos[3])
+    lines[#lines] = string.sub(lines[#lines], 1, end_pos[3])
+  end
+  
+  local message = table.concat(lines, "\n")
   M.send_message(message)
+end
+
+-- Send current line or paragraph
+function M.send_line()
+  local line = vim.api.nvim_get_current_line()
+  if line == "" then
+    -- Try to get paragraph
+    local start_line = vim.fn.search('^$', 'bnW') + 1
+    local end_line = vim.fn.search('^$', 'nW') - 1
+    if end_line < start_line then
+      end_line = vim.fn.line('$')
+    end
+    local lines = vim.fn.getline(start_line, end_line)
+    line = table.concat(lines, "\n")
+  end
+  
+  if line == "" then
+    vim.notify("[moltstream] No text to send", vim.log.levels.WARN)
+    return
+  end
+  
+  M.send_message(line)
 end
 
 -- Send any message string
@@ -342,56 +383,60 @@ function M.send_message(message)
     return
   end
 
-  -- Set current buffer as session buffer if not set
-  if not session_buf or not vim.api.nvim_buf_is_valid(session_buf) then
-    session_buf = vim.api.nvim_get_current_buf()
+  -- Ensure layout is open
+  if not agent_win or not vim.api.nvim_win_is_valid(agent_win) then
+    M.open()
   end
+
+  -- Add sent message to user buffer
+  vim.schedule(function()
+    if user_buf and vim.api.nvim_buf_is_valid(user_buf) then
+      local timestamp = os.date("%H:%M")
+      local lines = {
+        "---",
+        "",
+        "## Sent [" .. timestamp .. "]",
+        "",
+      }
+      for _, line in ipairs(vim.split(message, "\n", { plain = true })) do
+        table.insert(lines, line)
+      end
+      table.insert(lines, "")
+      
+      local line_count = vim.api.nvim_buf_line_count(user_buf)
+      vim.api.nvim_buf_set_lines(user_buf, line_count, line_count, false, lines)
+      
+      -- Scroll user window
+      if user_win and vim.api.nvim_win_is_valid(user_win) then
+        local new_count = vim.api.nvim_buf_line_count(user_buf)
+        vim.api.nvim_win_set_cursor(user_win, { new_count, 0 })
+      end
+    end
+  end)
 
   rpc_request("send", { content = message })
 end
 
-function M.new_message()
-  if not session_buf or not vim.api.nvim_buf_is_valid(session_buf) then
-    M.open()
-    -- Wait a bit for file to open
-    vim.defer_fn(M.new_message, 100)
+-- Fetch message history from server
+function M.fetch_history()
+  if not start_bridge() then
     return
   end
-
-  local timestamp = os.date("%H:%M")
-  local template = {
-    "",
-    "---",
-    "",
-    "## " .. config.user_name .. " [" .. timestamp .. "]",
-    "",
-    "",
-  }
-
-  vim.api.nvim_buf_set_lines(session_buf, -1, -1, false, template)
   
-  -- Move cursor to message area and enter insert mode
-  local line_count = vim.api.nvim_buf_line_count(session_buf)
-  local win = find_buffer_window(session_buf)
-  if win then
-    vim.api.nvim_win_set_cursor(win, { line_count, 0 })
-    vim.cmd("startinsert")
-  end
+  rpc_request("history", {})
+  vim.notify("[moltstream] Fetching history...", vim.log.levels.INFO)
 end
 
-function M.archive()
-  rpc_request("archive", {})
-  vim.notify("[moltstream] Session archived", vim.log.levels.INFO)
-end
-
+-- Get connection status
 function M.status()
+  if not start_bridge() then
+    return
+  end
+  
   rpc_request("status", {})
 end
 
-function M.reconnect()
-  rpc_request("reconnect", {})
-end
-
+-- Stop the bridge
 function M.stop()
   if job_id then
     vim.fn.jobstop(job_id)

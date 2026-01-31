@@ -201,6 +201,9 @@ func (b *Bridge) handleRequest(req *protocol.Request) {
 	case "session_path":
 		b.handleSessionPath(id)
 
+	case "history":
+		b.handleHistory(id)
+
 	default:
 		b.sendError(id, protocol.ErrMethodNotFound, "method not found")
 	}
@@ -254,6 +257,15 @@ func (b *Bridge) handleSessionPath(id int) {
 		return
 	}
 	b.sendResult(id, map[string]string{"path": path})
+}
+
+func (b *Bridge) handleHistory(id int) {
+	// TODO: Implement actual history fetching from gateway
+	// For now, send notification with empty history
+	b.sendNotification("history", map[string]interface{}{
+		"messages": []interface{}{},
+	})
+	b.sendResult(id, map[string]string{"status": "ok"})
 }
 
 func (b *Bridge) handleGatewayMessage(content string, done bool) {
